@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Rule-based customer support / product assistant for a fictional store.
+
+How it works
+  1. Input is normalized (lowercased, punctuation stripped, whitespace collapsed).
+  2. Every intent has weighted regex patterns. The intent with the highest total
+     score wins; a score of 2+ is "confident", a score of 1 triggers a clarifying
+     question, 0 triggers the fallback.
+  3. A small state machine drives the conversation:
+        LISTENING -> (CONFIRMING) -> RESOLVED -> exit
+     GREETING happens once at start-up; "bye", "exit" or "quit" work anywhere.
+  4. Context carries over: the last product mentioned ("buds") and the last topic
+     ("hours"), so "how much is it?" and "what about Sunday?" make sense.
+
+Optional extra FAQs from JSON (checked before the built-in ones):
+  python3 chatbot.py --data faq.json
+  {"intents": [{"name": "gift_cards", "label": "gift cards",
+                "patterns": [["gift ?cards?", 2]],
+                "response": "Gift cards are available from $10 to $200."}]}
+"""
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime
+
+BUSINESS = "Pulse Audio"
+EMAIL = "support@pulseaudio.example"
+PHONE = "1-800-555-0142"
+CONFIDENT = 2.0  # minimum score to answer directly
+
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+             "Saturday", "Sunday"]
+HOURS = {0: (9, 18), 1: (9, 18), 2: (9, 18), 3: (9, 18), 4: (9, 18),
+         5: (10, 16), 6: None}  # weekday -> (open hour, close hour) or closed
+
+PRODUCTS = {
+    "buds": {"name": "Pulse Buds", "price": 79,
+             "battery": "8 hours per charge, or 32 hours with the charging case",
+             "blurb": "wireless earbuds with active noise cancelling and IPX4 "
+                      "water resistance"},
+    "watch": {"name": "Pulse Watch", "price": 149,
+              "battery": "up to 5 days per charge",
+              "blurb": "a fitness smartwatch with heart-rate and sleep tracking"},
+    "speaker": {"name": "Pulse Speaker", "price": 99,
+                "battery": "12 hours of playback",
+                "blurb": "a portable Bluetooth speaker with a waterproof (IP67) body"},
+}
+
+PRODUCT_RE = re.compile(
+    r"\b(?P<buds>buds?|earbuds?|earphones?)\b"
+    r"|\b(?P<watch>watch(?:es)?|smartwatch)\b"
+    r"|\b(?P<speaker>speakers?)\b")
+DAY_RE = re.compile(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+                    r"mon|tues?|wed|thu(?:rs?)?|fri|sat|sun)\b")
+OPEN_NOW_RE = re.compile(r"\bare you (still |currently )?open\b|\bstill open\b|"
+                         r"\b(open|closed) (right )?now\b|\bcurrently\b|\bnow\b")
+ORDER_NUM_RE = re.compile(r"#?\b(\d{5,})\b")
+EXIT_RE = re.compile(r"(bye|goodbye|exit|quit)\b.*")
+YES_RE = re.compile(r"(y|yes|yeah|yep|yup|sure|ok|okay|correct|right|"
+                    r"that'?s right)( please)?")
+NO_RE = re.compile(r"(no|nope|nah|nothing( else)?|that'?s (all|it)|that is all|"
+                   r"i'?m (good|all set|done)|all set)( thanks| thank you| for now)?")
+
+
+# ---------------------------------------------------------------- helpers ----
+def normalize(raw):
+    """Lowercase, drop punctuation (keeping # $ ' -), collapse whitespace."""
+    text = re.sub(r"[^a-z0-9\s#$'\-]", " ", raw.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def products_in(text):
+    return [m.lastgroup for m in PRODUCT_RE.finditer(text)]
+
+
+def fmt_hour(h):
+    return f"{h % 12 or 12}:00 {'AM' if h < 12 else 'PM'}"
+
+
+def day_line(i):
+    h = HOURS[i]
+    return (f"We're open {DAY_NAMES[i]} {fmt_hour(h[0])} to {fmt_hour(h[1])}."
+            if h else f"We're closed on {DAY_NAMES[i]}.")
+
+
+def open_status(now):
+    i, mins = now.weekday(), now.hour * 60 + now.minute
+    h = HOURS[i]
+    if h and h[0] * 60 <= mins < h[1] * 60:
+        return f"Yes, we're open right now until {fmt_hour(h[1])}."
+    if h and mins < h[0] * 60:
+        nxt = f"today at {fmt_hour(h[0])}"
+    else:
+        for step in range(1, 8):
+            j = (i + step) % 7
+            if HOURS[j]:
+                when = "tomorrow" if step == 1 else DAY_NAMES[j]
+                nxt = f"{when} at {fmt_hour(HOURS[j][0])}"
+                break
+    return f"We're closed right now. Our next opening is {nxt}."
+
+
+# --------------------------------------------------------------- handlers ----
+def h_greeting(bot, text):
+    return "Hello again! How can I help you today?"
+
+
+def h_hours(bot, text):
+    now = bot.now()
+    if "weekend" in text:
+        return f"{day_line(5)} {day_line(6)}"
+    days = []
+    if re.search(r"\btomorrow\b", text):
+        days.append((now.weekday() + 1) % 7)
+    if re.search(r"\btoday\b", text):
+        days.append(now.weekday())
+    days += [["mon", "tue", "wed", "thu", "fri", "sat", "sun"].index(m.group(1)[:3])
+             for m in DAY_RE.finditer(text)]
+    if days:
+        return " ".join(day_line(i) for i in dict.fromkeys(days))
+    if OPEN_NOW_RE.search(text):
+        return open_status(now)
+    return ("Our opening hours:\n"
+            f"  Monday to Friday: {fmt_hour(9)} to {fmt_hour(18)}\n"
+            f"  Saturday:         {fmt_hour(10)} to {fmt_hour(16)}\n"
+            "  Sunday:           Closed")
+
+
+def h_shipping(bot, text):
+    return ("Standard shipping takes 3-5 business days and is free on orders over "
+            "$50. Express shipping (1-2 business days) is $12.99. Orders placed "
+            "before 2 PM ship the same day.")
+
+
+def h_returns(bot, text):
+    return ("You can return unused items in their original packaging within 30 "
+            "days for a full refund. We provide a free return label, and refunds "
+            "arrive 5-7 business days after we receive the item.")
+
+
+def h_warranty(bot, text):
+    return ("All Pulse products come with a 1-year limited warranty covering "
+            "manufacturing defects. Accidental damage and normal battery wear "
+            f"aren't covered. For a faulty item, contact us at {EMAIL}.")
+
+
+def _product_for(bot, text):
+    found = products_in(text)
+    key = found[-1] if found else bot.last_product
+    return PRODUCTS.get(key)
+
+
+def h_price(bot, text):
+    p = _product_for(bot, text)
+    if p:
+        return f"Price of the {p['name']}: ${p['price']}."
+    return "Our prices: " + ", ".join(f"{p['name']} ${p['price']}"
+                                       for p in PRODUCTS.values()) + "."
+
+
+def h_battery(bot, text):
+    p = _product_for(bot, text)
+    if p:
+        return f"Battery life of the {p['name']}: {p['battery']}."
+    return "Battery life: " + "; ".join(f"{p['name']} - {p['battery']}"
+                                         for p in PRODUCTS.values()) + "."
+
+
+def h_products(bot, text):
+    p = _product_for(bot, text)
+    if p:
+        return (f"{p['name']}: {p['blurb']}. Price: ${p['price']}. "
+                f"Battery: {p['battery']}.")
+    return ("We sell three products: "
+            + "; ".join(f"the {p['name']} ({p['blurb']}, ${p['price']})"
+                        for p in PRODUCTS.values())
+            + ". Ask about any of them for more detail.")
+
+
+def h_order(bot, text):
+    m = ORDER_NUM_RE.search(text)
+    if m:
+        bot.awaiting_order = False
+        return (f"Thanks - I've noted order #{m.group(1)}. I can't look up live "
+                f"order status in this chat, but our team can. Email {EMAIL} with "
+                "that number and they'll reply within one business day.")
+    bot.awaiting_order = True
+    return "Happy to help with an order. What's your order number (e.g. #123456)?"
+
+
+def h_contact(bot, text):
+    return (f"You can reach our team at {EMAIL} or {PHONE}, during opening hours "
+            "(ask me 'what are your hours?').")
+
+
+def h_thanks(bot, text):
+    return "You're welcome!"
+
+
+def h_help(bot, text):
+    return ("I can help with: opening hours, shipping, returns, warranty, prices, "
+            "battery life, product details, order questions and contact info. "
+            "Type 'bye' any time to leave.")
+
+
+# ---------------------------------------------------------------- intents ----
+class Intent:
+    def __init__(self, name, label, patterns, handler, follow_up=True):
+        self.name, self.label, self.handler, self.follow_up = name, label, handler, follow_up
+        self.patterns = [(re.compile(p, re.I), w) for p, w in patterns]
+
+    def score(self, text):
+        return sum(w for rx, w in self.patterns if rx.search(text))
+
+
+def build_intents():
+    I = Intent
+    return [
+        I("greeting", "a greeting", [(r"^(hi|hello|hey|hiya|good (morning|afternoon|evening))\b", 2)],
+          h_greeting, follow_up=False),
+        I("hours", "our opening hours",
+          [(r"\b(hours?|opening|closing|schedule)\b", 2), (r"\b(open|close[sd]?)\b", 2),
+           (r"\bwhat time\b|\bwhen\b", 1), (DAY_RE.pattern, 1), (r"\b(weekend|tomorrow)\b", 1)],
+          h_hours),
+        I("shipping", "shipping and delivery",
+          [(r"\b(ship\w*|deliver\w*|dispatch\w*|arrive)\b", 2), (r"\bhow long\b", 1)],
+          h_shipping),
+        I("returns", "returns and refunds",
+          [(r"\b(return\w*|refund\w*|exchange\w*|money back)\b", 2),
+           (r"\bsend (it )?back\b", 2)], h_returns),
+        I("warranty", "our warranty",
+          [(r"\b(warranty|guarantee|defect\w*|broken|faulty|repair\w*)\b", 2)], h_warranty),
+        I("price", "pricing",
+          [(r"\b(price\w*|cost\w*|how much|expensive|cheap\w*)\b", 2), (r"\bbuy\b|\$", 1)],
+          h_price),
+        I("battery", "battery life",
+          [(r"\b(battery|batteries|charging|charge)\b", 2), (r"\blast\b", 1)], h_battery),
+        I("products", "our products",
+          [(r"\b(tell me about|features?|specs?|details?|products?|sell|offer|catalog)\b", 2),
+           (PRODUCT_RE.pattern, 1)], h_products),
+        I("order", "an order",
+          [(r"\b(track\w*|order status|where is my order|my order)\b", 2),
+           (r"\border\b", 1)], h_order),
+        I("contact", "contacting our team",
+          [(r"\b(contact|email|phone|call|human|agent|representative|support|talk to)\b", 2)],
+          h_contact),
+        I("thanks", "a thank-you", [(r"\b(thanks?|thank you|thx|appreciate)\b", 2)], h_thanks),
+        I("help", "what I can do", [(r"\b(help|what can you do|menu|options)\b", 2)], h_help),
+    ]
+
+
+def load_custom_intents(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        intents = []
+        for item in data["intents"]:
+            response = item["response"]
+            intents.append(Intent(item["name"],
+                                  item.get("label", item["name"].replace("_", " ")),
+                                  [(p, float(w)) for p, w in item["patterns"]],
+                                  (lambda r: lambda bot, text: r)(response)))
+        return intents
+    except (OSError, ValueError, KeyError, TypeError, re.error) as exc:
+        sys.exit(f"Could not load {path}: {exc}")
+
+
+# -------------------------------------------------------------------- bot ----
+class Bot:
+    def __init__(self, intents, now=datetime.now):
+        self.intents, self.now = intents, now
+        self.state = "GREETING"
+        self.last_product = None
+        self.last_intent = None
+        self.pending = None          # (intent, text) awaiting user confirmation
+        self.awaiting_order = False
+        self.fallbacks = 0
+
+    def start(self):
+        hour = self.now().hour
+        part = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+        self.state = "LISTENING"
+        return (f"{part}! I'm Pulse, the {BUSINESS} assistant. Ask me about opening "
+                "hours, shipping, returns, warranty or our products. "
+                "Type 'bye' to leave.")
+
+    def classify(self, text):
+        best, best_score = None, 0.0
+        for intent in self.intents:
+            score = intent.score(text)
+            if score > 0 and intent is self.last_intent:
+                score += 1  # follow-up questions stay on topic
+            if score > best_score:
+                best, best_score = intent, score
+        return best, best_score
+
+    def answer(self, intent, text):
+        self.fallbacks = 0
+        self.last_intent = intent
+        reply = intent.handler(self, text)
+        if self.awaiting_order or not intent.follow_up:
+            self.state = "LISTENING"
+        else:
+            self.state = "RESOLVED"
+            reply += "\n\nIs there anything else I can help with?"
+        return reply
+
+    def fallback(self):
+        self.fallbacks += 1
+        self.state = "LISTENING"
+        if self.fallbacks == 1:
+            return ("Sorry, I'm not sure I understood that. I can help with opening "
+                    "hours, shipping, returns, warranty, prices, battery life and "
+                    "product details - could you try one of those?")
+        return (f"I'm still having trouble with that. Our team can help directly: "
+                f"{EMAIL} or {PHONE}. Or type 'help' to see what I can do.")
+
+    def respond(self, raw):
+        """Return (reply, finished)."""
+        text = normalize(raw)
+        if not text:
+            return "I didn't catch anything - type a question, or 'quit' to leave.", False
+        if EXIT_RE.fullmatch(text):
+            self.state = "CLOSING"
+            return f"Thanks for chatting with {BUSINESS} - goodbye!", True
+
+        found = products_in(text)
+        if found:
+            self.last_product = found[-1]
+
+        if self.state == "CONFIRMING":
+            intent, original = self.pending
+            self.pending = None
+            if YES_RE.fullmatch(text):
+                return self.answer(intent, original), False
+            self.state = "LISTENING"
+            if NO_RE.fullmatch(text):
+                return ("No problem - could you rephrase? You can ask about hours, "
+                        "shipping, returns, warranty, prices or products."), False
+        elif self.state == "RESOLVED":
+            if NO_RE.fullmatch(text):
+                self.state = "CLOSING"
+                return f"Glad I could help. Thanks for chatting with {BUSINESS} - goodbye!", True
+            if YES_RE.fullmatch(text):
+                self.state = "LISTENING"
+                return "Sure - what would you like to know?", False
+            self.state = "LISTENING"
+
+        if self.awaiting_order:
+            if ORDER_NUM_RE.search(text):
+                return self.answer(next(i for i in self.intents if i.name == "order"), text), False
+            self.awaiting_order = False  # user changed the subject
+
+        intent, score = self.classify(text)
+        if intent and score >= CONFIDENT:
+            return self.answer(intent, text), False
+        if intent:  # weak match: confirm instead of guessing
+            self.pending, self.state = (intent, text), "CONFIRMING"
+            return f"I'm not completely sure - did you mean a question about {intent.label}? (yes/no)", False
+        return self.fallback(), False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=f"{BUSINESS} support assistant")
+    parser.add_argument("--data", help="JSON file with extra FAQ intents")
+    parser.add_argument("--now", help=argparse.SUPPRESS)  # fake clock for testing
+    args = parser.parse_args()
+
+    intents = build_intents()
+    if args.data:
+        intents = load_custom_intents(args.data) + intents
+    clock = (lambda: datetime.strptime(args.now, "%Y-%m-%d %H:%M")) if args.now else datetime.now
+    bot = Bot(intents, clock)
+
+    print(f"Bot: {bot.start()}\n")
+    try:
+        while True:
+            reply, finished = bot.respond(input("You: "))
+            print(f"\nBot: {reply}\n")
+            if finished:
+                break
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n\nBot: Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
