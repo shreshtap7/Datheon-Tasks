@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Terminal Hangman: guess the secret word letter by letter, max 6 mistakes."""
+
+import random
+import string
+import sys
+
+MAX_MISTAKES = 6
+
+# Secret word array
+WORDS = [
+    "python", "keyboard", "compiler", "algorithm", "variable", "function",
+    "network", "database", "terminal", "software", "hardware", "internet",
+    "security", "protocol", "developer", "encryption", "interface", "library",
+    "processor", "recursion", "framework", "debugging", "bandwidth", "firewall",
+]
+
+# ASCII art: index = number of incorrect guesses (0..6)
+STAGES = [
+    """
+      +---+
+      |   |
+          |
+          |
+          |
+          |
+    =========
+    """,
+    """
+      +---+
+      |   |
+      O   |
+          |
+          |
+          |
+    =========
+    """,
+    """
+      +---+
+      |   |
+      O   |
+      |   |
+          |
+          |
+    =========
+    """,
+    """
+      +---+
+      |   |
+      O   |
+     /|   |
+          |
+          |
+    =========
+    """,
+    """
+      +---+
+      |   |
+      O   |
+     /|\\  |
+          |
+          |
+    =========
+    """,
+    """
+      +---+
+      |   |
+      O   |
+     /|\\  |
+     /    |
+          |
+    =========
+    """,
+    """
+      +---+
+      |   |
+      O   |
+     /|\\  |
+     / \\  |
+          |
+    =========
+    """,
+]
+
+
+def mask(word, correct):
+    """Masked string such as '_ A _ H E O N'."""
+    return " ".join(ch.upper() if ch in correct else "_" for ch in word)
+
+
+def show_state(word, correct, wrong):
+    left = MAX_MISTAKES - len(wrong)
+    print(STAGES[len(wrong)])
+    print(f"  Word:   {mask(word, correct)}")
+    print(f"  Wrong:  {' '.join(sorted(wrong)).upper() or '-'}   "
+          f"({left} mistake{'s' if left != 1 else ''} left)")
+    print(f"  Guessed: {' '.join(sorted(correct | wrong)).upper() or '-'}\n")
+
+
+def read_guess(correct, wrong):
+    """Prompt until a valid, new single letter is entered (repeats cost nothing)."""
+    while True:
+        raw = input("Guess a letter: ").strip().lower()
+        if len(raw) != 1 or raw not in string.ascii_lowercase:
+            print("Please enter a single letter (A-Z).")
+        elif raw in correct or raw in wrong:
+            print(f"You already guessed '{raw.upper()}'. No penalty - try another.")
+        else:
+            return raw
+
+
+def play(word):
+    correct, wrong = set(), set()
+    letters = set(word)
+    print("\n=== HANGMAN ===")
+    print(f"The word has {len(word)} letters. You may make {MAX_MISTAKES} mistakes.")
+
+    while len(wrong) < MAX_MISTAKES and not letters <= correct:
+        show_state(word, correct, wrong)
+        guess = read_guess(correct, wrong)
+        if guess in word:
+            correct.add(guess)
+            print(f"Good guess! '{guess.upper()}' is in the word.")
+        else:
+            wrong.add(guess)
+            print(f"Sorry, '{guess.upper()}' is not in the word.")
+
+    show_state(word, correct, wrong)
+    if letters <= correct:
+        print(f"You won! The word was '{word.upper()}'.")
+    else:
+        print(f"You lost. The word was '{word.upper()}'.")
+
+
+def main():
+    forced = sys.argv[1].lower() if len(sys.argv) > 1 else None  # for testing
+    try:
+        while True:
+            play(forced or random.choice(WORDS))
+            if input("\nPlay again? (y/n): ").strip().lower() != "y":
+                break
+    except (EOFError, KeyboardInterrupt):
+        pass
+    print("\nThanks for playing!")
+
+
+if __name__ == "__main__":
+    main()
