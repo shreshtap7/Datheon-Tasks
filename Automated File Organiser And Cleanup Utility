@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Organize a cluttered folder (default: ~/Downloads) into category subfolders.
+
+Usage:
+  python3 organizer.py                  # organize ~/Downloads
+  python3 organizer.py PATH --dry-run   # preview only, move nothing
+"""
+
+import argparse
+import os
+import shutil
+import sys
+
+# Extension -> category folder. Extend freely.
+EXTENSION_MAP = {
+    # Documents
+    ".pdf": "Documents", ".doc": "Documents", ".docx": "Documents",
+    ".txt": "Documents", ".rtf": "Documents", ".odt": "Documents",
+    ".xls": "Documents", ".xlsx": "Documents", ".csv": "Documents",
+    ".ppt": "Documents", ".pptx": "Documents", ".md": "Documents",
+    # Images
+    ".jpg": "Images", ".jpeg": "Images", ".png": "Images", ".gif": "Images",
+    ".bmp": "Images", ".webp": "Images", ".svg": "Images", ".heic": "Images",
+    # Videos
+    ".mp4": "Videos", ".mkv": "Videos", ".avi": "Videos", ".mov": "Videos",
+    ".wmv": "Videos", ".webm": "Videos",
+    # Archives
+    ".zip": "Archives", ".rar": "Archives", ".7z": "Archives",
+    ".tar": "Archives", ".gz": "Archives", ".iso": "Archives",
+    # Code
+    ".py": "Code", ".js": "Code", ".ts": "Code", ".java": "Code",
+    ".c": "Code", ".cpp": "Code", ".go": "Code", ".html": "Code",
+    ".css": "Code", ".json": "Code", ".sh": "Code", ".sql": "Code",
+}
+SKIP_EXTENSIONS = {".crdownload", ".part", ".tmp", ".download"}  # unfinished
+
+
+def unique_destination(folder, filename):
+    """Return a path in folder that doesn't exist yet: 'a.pdf', 'a (1).pdf', ..."""
+    stem, ext = os.path.splitext(filename)
+    path = os.path.join(folder, filename)
+    n = 1
+    while os.path.lexists(path):
+        path = os.path.join(folder, f"{stem} ({n}){ext}")
+        n += 1
+    return path
+
+
+def organize(root, dry_run=False):
+    moved = {}    # category -> count
+    errors = []   # (filename, reason)
+    left = 0      # files not moved on purpose
+
+    try:
+        scan = os.scandir(root)
+    except PermissionError:
+        sys.exit(f"Cannot read folder (permission denied): {root}")
+
+    with scan as entries:
+        candidates = sorted(entries, key=lambda e: e.name.lower())
+
+    for entry in candidates:
+        if entry.name == os.path.basename(__file__):
+            continue  # never move this script
+        if (entry.name.startswith(".") or entry.is_symlink()
+                or not entry.is_file(follow_symlinks=False)):
+            left += 1
+            continue
+
+        ext = os.path.splitext(entry.name)[1].lower()
+        category = EXTENSION_MAP.get(ext)
+        if category is None or ext in SKIP_EXTENSIONS:
+            left += 1
+            continue
+
+        target_dir = os.path.join(root, category)
+        try:
+            dest = unique_destination(target_dir, entry.name)
+            if dry_run:
+                print(f"[dry-run] {entry.name} -> {category}/{os.path.basename(dest)}")
+            else:
+                os.makedirs(target_dir, exist_ok=True)  # created only when needed
+                shutil.move(entry.path, dest)
+                print(f"Moved {entry.name} -> {category}/{os.path.basename(dest)}")
+            moved[category] = moved.get(category, 0) + 1
+        except FileExistsError:
+            errors.append((entry.name, "a file or folder with that name already exists"))
+            print(f"Skipped {entry.name}: destination already exists")
+        except PermissionError:
+            errors.append((entry.name, "permission denied"))
+            print(f"Skipped {entry.name}: permission denied")
+        except OSError as exc:  # file in use, vanished, disk full...
+            errors.append((entry.name, exc.strerror or str(exc)))
+            print(f"Skipped {entry.name}: {exc.strerror or exc}")
+
+    return moved, left, errors
+
+
+def print_summary(root, moved, left, errors, dry_run):
+    total = sum(moved.values())
+    label = "would be relocated" if dry_run else "relocated"
+    line = "=" * 40
+    print(f"\n{line}\n  EXECUTION SUMMARY{' (DRY RUN)' if dry_run else ''}\n{line}")
+    print(f"  Folder:          {root}")
+    for category in sorted(moved):
+        print(f"  {category:<16} {moved[category]:>4}")
+    print(f"  {'-' * 22}")
+    print(f"  Total files {label}: {total}")
+    print(f"  Left in place:   {left}")
+    print(f"  Errors:          {len(errors)}")
+    for name, reason in errors:
+        print(f"    - {name}: {reason}")
+    print(line)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Organize a cluttered folder.")
+    parser.add_argument("folder", nargs="?",
+                        default=os.path.join(os.path.expanduser("~"), "Downloads"),
+                        help="folder to organize (default: ~/Downloads)")
+    parser.add_argument("-n", "--dry-run", action="store_true",
+                        help="show what would happen without moving anything")
+    args = parser.parse_args()
+
+    root = os.path.abspath(os.path.expanduser(args.folder))
+    if not os.path.isdir(root):
+        sys.exit(f"Not a folder: {root}")
+
+    print(f"{'Previewing' if args.dry_run else 'Organizing'}: {root}\n")
+    moved, left, errors = organize(root, args.dry_run)
+    print_summary(root, moved, left, errors, args.dry_run)
+
+
+if __name__ == "__main__":
+    main()
