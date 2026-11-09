@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Portfolio tracker: record stock purchases, value the portfolio, log to CSV.
+
+Files (created in --dir, default: current folder):
+  transactions.csv       one row appended for every purchase (also the data store;
+                         holdings are rebuilt from it on startup)
+  prices.csv             current prices (columns: ticker,price). Edit it by hand,
+                         or use menu option 2. Re-read every time you view the
+                         portfolio. Tickers missing from it are valued at cost.
+  portfolio_summary.csv  a snapshot of every holding + a TOTAL row (invested vs
+                         market value), appended each time the report is viewed
+
+Usage: python3 portfolio.py [--dir FOLDER] [--live]
+  --live  fetch current prices with yfinance (if installed and online),
+          falling back to prices.csv for anything it can't fetch.
+"""
+
+import argparse
+import csv
+import os
+import re
+from datetime import datetime
+
+TX_FIELDS = ["timestamp", "ticker", "action", "quantity", "price", "total_cost"]
+SUM_FIELDS = ["timestamp", "ticker", "shares", "avg_cost", "current_price",
+              "cost_basis", "market_value", "gain_loss", "gain_loss_pct"]
+TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")
+
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def append_row(path, fields, rows):
+    """Append rows to a CSV, writing the header if the file is new/empty."""
+    new_file = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if new_file:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def load_holdings(path):
+    """Rebuild {ticker: {"shares", "cost"}} from the transaction log."""
+    holdings = {}
+    if not os.path.exists(path):
+        return holdings
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            try:
+                qty, cost = float(row["quantity"]), float(row["total_cost"])
+            except (KeyError, ValueError):
+                continue  # skip malformed rows
+            h = holdings.setdefault(row["ticker"], {"shares": 0.0, "cost": 0.0})
+            h["shares"] += qty
+            h["cost"] += cost
+    return holdings
+
+
+def load_prices(path):
+    """Read {ticker: price} from prices.csv (missing/bad rows are skipped)."""
+    prices = {}
+    if os.path.exists(path):
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                try:
+                    prices[row["ticker"].strip().upper()] = float(row["price"])
+                except (KeyError, ValueError, AttributeError):
+                    continue
+    return prices
+
+
+def save_prices(path, prices):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["ticker", "price"])
+        for ticker in sorted(prices):
+            writer.writerow([ticker, f"{prices[ticker]:.2f}"])
+
+
+def fetch_live_prices(tickers):
+    """Best-effort live quotes via yfinance; returns {} if unavailable."""
+    try:
+        import yfinance as yf
+    except ImportError:
+        print("(yfinance not installed - using prices.csv)")
+        return {}
+    live = {}
+    for t in tickers:
+        try:
+            price = yf.Ticker(t).fast_info["last_price"]
+            if price and price > 0:
+                live[t] = float(price)
+        except Exception:
+            print(f"(could not fetch live price for {t} - using prices.csv)")
+    return live
+
+
+def ask(prompt, cast, check, error):
+    """Prompt until cast(input) succeeds and check(value) is true."""
+    while True:
+        raw = input(prompt).strip()
+        try:
+            value = cast(raw)
+            if check(value):
+                return value
+        except ValueError:
+            pass
+        print(error)
+
+
+def ask_ticker():
+    return ask("Ticker symbol: ", str.upper, TICKER_RE.match,
+               "Enter a valid ticker (e.g. AAPL, BRK.B).")
+
+
+def ask_positive(prompt):
+    return ask(prompt, float, lambda v: v > 0 and v < 1e12,
+               "Enter a positive number.")
+
+
+def add_purchase(holdings, prices, tx_path, price_path):
+    ticker = ask_ticker()
+    price = ask_positive("Buy price per share: ")
+    qty = ask_positive("Number of shares: ")
+    total = round(price * qty, 2)
+
+    h = holdings.setdefault(ticker, {"shares": 0.0, "cost": 0.0})
+    h["shares"] += qty
+    h["cost"] += price * qty
+    if ticker not in prices:  # seed prices.csv so it can be edited later
+        prices[ticker] = price
+        save_prices(price_path, prices)
+
+    append_row(tx_path, TX_FIELDS, [{
+        "timestamp": now(), "ticker": ticker, "action": "BUY",
+        "quantity": f"{qty:g}", "price": f"{price:.2f}", "total_cost": f"{total:.2f}",
+    }])
+    print(f"Recorded: BUY {qty:g} {ticker} @ {price:.2f} = {total:,.2f} (logged to CSV)")
+
+
+def update_price(holdings, prices, price_path):
+    if not holdings:
+        print("No holdings yet. Add a purchase first.")
+        return
+    ticker = ask_ticker()
+    if ticker not in holdings:
+        print(f"You don't hold {ticker}. Holdings: {', '.join(sorted(holdings))}")
+        return
+    prices[ticker] = ask_positive(f"Current price of {ticker}: ")
+    save_prices(price_path, prices)
+    print(f"Updated {ticker} to {prices[ticker]:.2f} (saved to prices.csv)")
+
+
+def view_portfolio(holdings, prices, sum_path, price_path, live):
+    if not holdings:
+        print("Portfolio is empty. Add a purchase first.")
+        return
+    prices.update(load_prices(price_path))  # pick up hand edits to prices.csv
+    if live:
+        prices.update(fetch_live_prices(sorted(holdings)))
+
+    rows, total_cost, total_value = [], 0.0, 0.0
+    print(f"\n{'Ticker':<7}{'Shares':>9}{'Avg Cost':>11}{'Price':>10}"
+          f"{'Value':>13}{'Gain/Loss':>13}{'%':>9}")
+    print("-" * 72)
+    for ticker in sorted(holdings):
+        h = holdings[ticker]
+        avg = h["cost"] / h["shares"]
+        price = prices.get(ticker, avg)
+        value = price * h["shares"]
+        gl = value - h["cost"]
+        pct = gl / h["cost"] * 100
+        total_cost += h["cost"]
+        total_value += value
+        print(f"{ticker:<7}{h['shares']:>9g}{avg:>11,.2f}{price:>10,.2f}"
+              f"{value:>13,.2f}{gl:>+13,.2f}{pct:>+8.2f}%")
+        rows.append({
+            "ticker": ticker, "shares": f"{h['shares']:g}", "avg_cost": f"{avg:.2f}",
+            "current_price": f"{price:.2f}", "cost_basis": f"{h['cost']:.2f}",
+            "market_value": f"{value:.2f}", "gain_loss": f"{gl:.2f}",
+            "gain_loss_pct": f"{pct:.2f}",
+        })
+
+    total_gl = total_value - total_cost
+    total_pct = total_gl / total_cost * 100
+    print("-" * 72)
+    print(f"{'TOTAL':<7}{'':>9}{'':>11}{'':>10}{total_value:>13,.2f}"
+          f"{total_gl:>+13,.2f}{total_pct:>+8.2f}%")
+    print(f"Total invested: {total_cost:,.2f}\n")
+
+    rows.append({
+        "ticker": "TOTAL", "shares": "", "avg_cost": "", "current_price": "",
+        "cost_basis": f"{total_cost:.2f}", "market_value": f"{total_value:.2f}",
+        "gain_loss": f"{total_gl:.2f}", "gain_loss_pct": f"{total_pct:.2f}",
+    })
+    stamp = now()
+    for r in rows:
+        r["timestamp"] = stamp
+    append_row(sum_path, SUM_FIELDS, rows)
+    print(f"Summary logged to {sum_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Portfolio tracker")
+    parser.add_argument("--dir", default=".", help="folder for the CSV files")
+    parser.add_argument("--live", action="store_true",
+                        help="fetch live prices with yfinance when viewing")
+    args = parser.parse_args()
+    os.makedirs(args.dir, exist_ok=True)
+    tx_path = os.path.join(args.dir, "transactions.csv")
+    sum_path = os.path.join(args.dir, "portfolio_summary.csv")
+    price_path = os.path.join(args.dir, "prices.csv")
+
+    holdings = load_holdings(tx_path)  # positions: {ticker: {"shares", "cost"}}
+    prices = load_prices(price_path)
+    if holdings:
+        print(f"Loaded {len(holdings)} holding(s) from {tx_path}")
+
+    menu = ("\n=== PORTFOLIO TRACKER ===\n"
+            "1) Add purchase\n2) Update current price\n"
+            "3) View portfolio (and log summary)\n4) Quit")
+    try:
+        while True:
+            print(menu)
+            choice = input("Choose: ").strip()
+            if choice == "1":
+                add_purchase(holdings, prices, tx_path, price_path)
+            elif choice == "2":
+                update_price(holdings, prices, price_path)
+            elif choice == "3":
+                view_portfolio(holdings, prices, sum_path, price_path, args.live)
+            elif choice == "4":
+                break
+            else:
+                print("Please choose 1-4.")
+    except (EOFError, KeyboardInterrupt):
+        print()
+    print("Goodbye!")
+
+
+if __name__ == "__main__":
+    main()
